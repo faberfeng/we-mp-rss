@@ -92,6 +92,8 @@ class TaskItem:
     args: tuple = field(default_factory=tuple)
     kwargs: dict = field(default_factory=dict)
     max_retries: int = 3
+    # 去重用的稳定 key（如 f"mp:{mp_id}"）。为空时退化为按 task_name 去重。
+    task_key: str = ""
     
     def _serialize_value(self, value: Any) -> Any:
         """安全序列化值，处理不可 JSON 序列化的对象"""
@@ -112,8 +114,14 @@ class TaskItem:
             'task_name': self.task_name,
             'args': self._serialize_value(list(self.args) if self.args else []),
             'kwargs': self._serialize_value(self.kwargs),
-            'max_retries': self.max_retries
+            'max_retries': self.max_retries,
+            'task_key': self.task_key
         }
+
+    def dedupe_key(self) -> str:
+        """返回去重 key：优先使用稳定 key，未设置时退化为展示名"""
+        return self.task_key or self.task_name
+
 
 
 @dataclass
@@ -157,6 +165,8 @@ class TaskQueueManager:
         self._history_max_size = 100
         # 当前执行的任务
         self._current_task: Optional[TaskRecord] = None
+        # 当前执行任务的去重 key（与 TaskItem.task_key 对应）
+        self._current_task_key: Optional[str] = None
         # 待执行任务列表（用于展示）
         self._pending_items: list[TaskItem] = []
         self._instance_id = id(self)
@@ -328,7 +338,7 @@ class TaskQueueManager:
             print_error(f"从 Redis 获取历史记录数量失败: {e}")
             return 0
         
-    def add_task(self, task: Callable[..., Any], *args: Any, max_retries: int = 3, task_name: str = None, **kwargs: Any) -> bool:
+    def add_task(self, task: Callable[..., Any], *args: Any, max_retries: int = 3, task_name: str = None, task_key: str = None, **kwargs: Any) -> bool:
         """添加任务到队列
         
         Args:
@@ -336,6 +346,9 @@ class TaskQueueManager:
             *args: 任务函数的参数
             max_retries: 最大重试次数，默认3次
             task_name: 自定义任务名称（可选），用于显示，如公众号名称
+            task_key: 去重用的稳定 key（可选），如 f"mp:{mp_id}"。
+                      不传时退化为按 task_name 去重；同名任务会互相跳过，因此
+                      同一类任务应显式传入稳定的业务 key。
             **kwargs: 任务函数的关键字参数
             
         Returns:
@@ -346,17 +359,21 @@ class TaskQueueManager:
         with self._thread_lock:
             # 获取任务显示名称
             display_name = task_name or getattr(task, '__name__', str(task))
+            dedupe_key = task_key or display_name
             
-            # 检查任务是否已在队列中（根据 task_name 去重）
+            # 检查任务是否已排队或正在执行（按稳定 key 去重）
             for pending_item in self._pending_items:
-                if pending_item.task_name == display_name:
+                if pending_item.dedupe_key() == dedupe_key:
                     print_warning(f"{self.tag}任务已在队列中，跳过 [{display_name}]")
                     return False
+            if self._current_task is not None and self._current_task_key == dedupe_key:
+                print_warning(f"{self.tag}任务正在执行，跳过 [{display_name}]")
+                return False
             
             # 检查队列是否已满（如果设置了maxsize）
             try:
-                # 将 task_name 存储在队列项中
-                self._queue.put_nowait((task, args, kwargs, max_retries, task_name))
+                # 将 task_name / task_key 存储在队列项中
+                self._queue.put_nowait((task, args, kwargs, max_retries, task_name, task_key))
             except queue.Full:
                 print_error(f"{self.tag}队列已满，任务添加失败")
                 return False
@@ -366,7 +383,8 @@ class TaskQueueManager:
                 task_name=display_name,
                 args=args,
                 kwargs=kwargs,
-                max_retries=max_retries
+                max_retries=max_retries,
+                task_key=task_key or ""
             ))
             
             # 优化：只追加新任务到 Redis，而不是全量重写
@@ -390,6 +408,13 @@ class TaskQueueManager:
         # print_success(f"{self.tag}队列任务添加成功 [{display_name}]\n")
         return True
         
+    def has_task(self, task_key: str) -> bool:
+        """判断某个去重 key 的任务是否正在排队或执行中。"""
+        with self._thread_lock:
+            if self._current_task is not None and self._current_task_key == task_key:
+                return True
+            return any(item.dedupe_key() == task_key for item in self._pending_items)
+
     def run_task_background(self)->None:
         threading.Thread(target=self.run_tasks, daemon=True).start()  
         print_warning(f"队列任务后台运行, instance id: {self._instance_id}")
@@ -413,8 +438,11 @@ class TaskQueueManager:
                     # 阻塞获取任务，避免CPU空转
                     task_item = self._queue.get(timeout=timeout)
                     
-                    # 兼容多种格式：5个元素(新格式带task_name)，4个元素，3个元素(旧格式)
-                    if len(task_item) == 5:
+                    # 兼容多种格式：6个元素(带task_key)，5个元素(带task_name)，4个元素，3个元素(旧格式)
+                    custom_task_key = None
+                    if len(task_item) == 6:
+                        task, args, kwargs, max_retries, custom_task_name, custom_task_key = task_item
+                    elif len(task_item) == 5:
                         task, args, kwargs, max_retries, custom_task_name = task_item
                     elif len(task_item) == 4:
                         task, args, kwargs, max_retries = task_item
@@ -437,6 +465,7 @@ class TaskQueueManager:
                             task_name=task_name,
                             start_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         )
+                        self._current_task_key = custom_task_key or task_name
                         # 保存当前任务到 Redis
                         self._save_current_task_to_redis(self._current_task)
                     
@@ -508,6 +537,7 @@ class TaskQueueManager:
                             if len(self._history) > self._history_max_size:
                                 self._history = self._history[-self._history_max_size:]
                             self._current_task = None
+                            self._current_task_key = None
                             # 清除 Redis 当前任务
                             self._save_current_task_to_redis(None)
                             self._save_status_to_redis()

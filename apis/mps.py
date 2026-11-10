@@ -15,7 +15,6 @@ from core.models.base import DATA_STATUS
 from core.cache import clear_cache_pattern
 import io
 import os
-from jobs.article import UpdateArticle
 from driver.wxarticle import WXArticleFetcher
 import threading
 from uuid import uuid4
@@ -227,6 +226,7 @@ async def get_mps(
     offset: int = Query(0, ge=0),
     kw: str = Query(""),
     status: int = Query(None, description="状态筛选: 1=启用, 0=停用, 不传=全部"),
+    tag_id: str = Query(None, description="按标签筛选公众号"),
     current_user: dict = Depends(get_current_user_or_ak)
 ):
     session = DB.get_session()
@@ -237,6 +237,16 @@ async def get_mps(
             query = query.filter(Feed.mp_name.ilike(f"%{kw}%"))
         if status is not None:
             query = query.filter(Feed.status == status)
+        if tag_id:
+            import json
+            from core.models.tags import Tags
+            tag = session.query(Tags).filter(Tags.id == tag_id).first()
+            try:
+                tag_data = json.loads(tag.mps_id or "[]") if tag else []
+                tagged_ids = [str(item.get("id")) for item in tag_data if isinstance(item, dict) and item.get("id")]
+            except (TypeError, ValueError):
+                tagged_ids = []
+            query = query.filter(Feed.id.in_(tagged_ids))
         total = query.count()
         mps = query.order_by(Feed.created_at.desc()).limit(limit).offset(offset).all()
         mps_list = [{
@@ -340,12 +350,29 @@ async def get_featured_article_task_status(
     return success_response(task)
 
 @router.get("/update/{mp_id}", summary="更新公众号文章")
-async def update_mps(
+def update_mps(
      mp_id: str,
      start_page: int = 0,
      end_page: int = 1,
+     wait: bool = True,
     current_user: dict = Depends(get_current_user_or_ak)
 ):
+    # 批量刷新：'all' 表示全部启用的公众号。逐个入队后立即返回，
+    # 由队列串行执行，避免一次点击把所有公众号并发拉起来。
+    if mp_id == "all":
+        from core.mp_sync import request_sync_all
+        batch = request_sync_all(
+            reason="manual-batch",
+            max_page=end_page,
+        )
+        return success_response({
+            "queued": batch["queued"],
+            "skipped": batch["skipped"],
+            "total": batch["total"],
+            "count": len(batch["queued"]),
+            "message": f"已加入采集队列 {len(batch['queued'])} 个公众号，排队执行",
+        })
+
     session = DB.get_session()
     try:
         from core.models.feed import Feed
@@ -366,21 +393,20 @@ async def update_mps(
                     message="请不要频繁更新操作",
                     data={"time_span":time_span}
                 )
-        # 同步采集，等待结果返回；失败时把真实原因透出给前端，
+        # 采集统一走队列：同时刷多个公众号时仍然串行执行，降低并发压力；
+        # wait=True 时等待本次采集结束再把真实结果/错误返回给前端，
         # 避免「异步线程 + 异常被吞」导致前端只看到“刷新成功”但实际 0 篇入库。
-        from core.wx import WxGather
-        wx = WxGather().Model()
-        try:
-            wx.get_Articles(
-                mp.faker_id,
-                Mps_id=mp.id,
-                Mps_title=mp.mp_name,
-                CallBack=UpdateArticle,
-                start_page=start_page,
-                MaxPage=end_page,
-            )
-        except Exception as e:
-            err = str(e)
+        from core.mp_sync import DEFAULT_WAIT_TIMEOUT, request_sync
+        result = request_sync(
+            mp.id,
+            reason="manual",
+            start_page=start_page,
+            max_page=end_page,
+            wait_timeout=DEFAULT_WAIT_TIMEOUT if wait else 0,
+        )
+        status_value = result.get("status")
+        if status_value == "failed":
+            err = result.get("error") or "采集失败"
             # 微信读书登录态失效等，给出可操作的明确提示
             hint = ""
             if any(k in err for k in ("401", "鉴权", "-2013", "-2012", "登录超时", "登录态")):
@@ -389,12 +415,20 @@ async def update_mps(
             return error_response(
                 code=50002,
                 message=f"更新「{mp.mp_name}」失败: {err}{hint}",
-                data={"mp_id": mp_id},
+                data={"mp_id": mp_id, "sync": result},
             )
+        total = int(result.get("article_count") or 0)
+        if result.get("timed_out"):
+            print(f"更新公众号文章仍在排队/执行 [{mp.mp_name}]")
         return success_response({
             "time_span":time_span,
-            "list":wx.articles,
-            "total":len(wx.articles),
+            "total": total,
+            "count": total,
+            "list": [],
+            "status": status_value,
+            "queued": result.get("queued"),
+            "timed_out": result.get("timed_out"),
+            "sync": result,
             "mps":mp
         })
     except Exception as e:
@@ -406,6 +440,47 @@ async def update_mps(
                 message=f"更新公众号文章{str(e)}"
             )
         )
+
+
+@router.get("/sync/status", summary="获取公众号采集队列状态")
+async def get_mp_sync_status(
+    current_user: dict = Depends(get_current_user_or_ak)
+):
+    """返回每个公众号最近一次采集的状态（排队中/采集中/成功/失败）。"""
+    from core.mp_sync import get_sync_status
+    return success_response(get_sync_status())
+
+
+@router.get("/sync/status/{mp_id}", summary="获取单个公众号采集状态")
+async def get_mp_sync_status_detail(
+    mp_id: str,
+    current_user: dict = Depends(get_current_user_or_ak)
+):
+    from core.mp_sync import get_sync_status
+    return success_response(get_sync_status(mp_id))
+
+
+@router.post("/sync/{mp_id}", summary="把公众号加入采集队列")
+async def trigger_mp_sync(
+    mp_id: str,
+    start_page: int = 0,
+    end_page: int = 1,
+    current_user: dict = Depends(get_current_user_or_ak)
+):
+    """异步触发一个公众号的采集，立即返回排队状态（不等待采集结束）。"""
+    from core.mp_sync import request_sync
+    result = request_sync(
+        mp_id,
+        reason="api",
+        start_page=start_page,
+        max_page=end_page,
+        wait_timeout=0,
+    )
+    if result.get("status") == "failed" and not result.get("queued"):
+        return error_response(code=50002, message=result.get("error") or "加入采集队列失败", data=result)
+    message = "已加入采集队列" if result.get("queued") else "该公众号已在采集队列中"
+    return success_response(result, message=message)
+
 
 @router.get("/{mp_id}", summary="获取公众号详情")
 async def get_mp(
@@ -462,7 +537,7 @@ async def get_mp_by_article(
         )
 
 @router.post("", summary="添加公众号")
-async def add_mp(
+def add_mp(
     mp_name: str = Body(..., min_length=1, max_length=255),
     mp_cover: str = Body(None, max_length=255),
     mp_id: str = Body(None, max_length=255),
@@ -508,13 +583,17 @@ async def add_mp(
         session.commit()
         
         feed = existing_feed if existing_feed else new_feed
-         #在这里实现第一次添加获取公众号文章
-        if not existing_feed:
-            from core.queue import TaskQueue
-            from core.wx import WxGather
-            Max_page=int(cfg.get("max_page","2"))
-            TaskQueue.add_task(WxGather().Model().get_Articles, faker_id=feed.faker_id, Mps_id=feed.id, CallBack=UpdateArticle, MaxPage=Max_page, Mps_title=mp_name, task_name=mp_name)
-            
+        # 新增或重新添加都把公众号放进采集队列：队列串行执行，连续添加多个公众号时
+        # 不会并发抢微信接口；同一公众号重复提交只保留一个待执行任务。
+        # 入队只传 mp_id，采集器在 worker 线程内创建，避免排队太久导致会话过期。
+        from core.mp_sync import request_sync
+        sync_state = request_sync(
+            feed.id,
+            reason="add" if not existing_feed else "re-add",
+            max_page=int(cfg.get("max_page", 5) or 5),
+            wait_timeout=0,
+        )
+
         return success_response({
             "id": feed.id,
             "mp_name": feed.mp_name,
@@ -522,7 +601,8 @@ async def add_mp(
             "mp_intro": feed.mp_intro,
             "status": feed.status,
             "faker_id":mp_id,
-            "created_at": feed.created_at.isoformat()
+            "created_at": feed.created_at.isoformat(),
+            "sync": sync_state
         })
     except Exception as e:
         session.rollback()

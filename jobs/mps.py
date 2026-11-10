@@ -142,6 +142,12 @@ def do_job(mp=None,task:MessageTask=None,isTest=False):
                     article_count=count,
                     error=error_msg
                 )
+        # 返回本次结果，供队列入口记录采集状态
+        return {
+            "success": success and count > 0,
+            "count": count,
+            "error": error_msg or "",
+        }
 
 from core.queue import TaskQueue
 
@@ -218,6 +224,16 @@ class MessageTaskTracker:
         with self._task_lock:
             return self._tasks.get(task_id, {})
 
+    def set_total(self, task_id: str, total: int) -> None:
+        """按实际入队数量收敛任务总数（队列去重后可能少于计划数）。"""
+        with self._task_lock:
+            task_info = self._tasks.get(task_id)
+            if not task_info:
+                return
+            task_info['total'] = total
+            if task_info['completed'] + task_info['failed'] >= task_info['total']:
+                self._finish_task(task_id)
+
 tracker = MessageTaskTracker()
 
 
@@ -256,15 +272,76 @@ def add_job(feeds:list[Feed]=None,task:MessageTask=None,isTest=False):
     if task and not isTest and feeds:
         tracker.start_task(task.id, len(feeds))
 
+    queued_count = 0
     for feed in feeds:
-        # 使用公众号名称作为任务显示名称
-        TaskQueue.add_task(do_job, feed, task, isTest, task_name=feed.mp_name)
+        # 入队只传公众号 id / 任务 id，Feed、MessageTask 在 worker 线程内重新读取，
+        # 避免把 ORM 对象跨线程传进队列（会话关闭后访问字段会抛 DetachedInstanceError）。
+        # task_key 用公众号 id 去重：同一公众号在排队或执行中不会被重复触发，
+        # 每日定时与手动刷新也共用同一条串行通道，减少并发压力。
+        mp_id = getattr(feed, "id", None)
+        mp_name = getattr(feed, "mp_name", mp_id)
+        if not mp_id:
+            print_warning(f"订阅号缺少 id，跳过入队: {mp_name}")
+            continue
+        added = TaskQueue.add_task(
+            do_job_by_id,
+            mp_id,
+            task.id if task else None,
+            isTest,
+            task_name=mp_name,
+            task_key=f"mp:{mp_id}",
+        )
+        if added:
+            queued_count += 1
+        else:
+            print(f"{mp_name}，已在采集队列中，跳过重复入队")
         if isTest:
-            print(f"测试任务，{feed.mp_name}，加入队列成功")
+            print(f"测试任务，{mp_name}，加入队列成功")
             break
-        print(f"{feed.mp_name}，加入队列成功")
+        if added:
+            print(f"{mp_name}，加入队列成功")
+    # 去重后实际入队的数量可能与计划数不同，按真实入队数收敛任务追踪，
+    # 避免「有重复被跳过」时任务永远停在未完成状态。
+    if task and not isTest and feeds:
+        tracker.set_total(task.id, queued_count)
     print_success(TaskQueue.get_queue_info())
     pass
+
+
+def do_job_by_id(mp_id: str, task_id: str = None, isTest=False):
+    """队列 worker 入口：在 worker 线程内解析公众号与消息任务后执行采集。
+
+    每日定时任务与手动执行都通过这里排队，保证同一时刻只有一个公众号在采集，
+    同时每个公众号都能排到一次执行。执行过程会登记到 core.mp_sync 的状态表，
+    手动刷新与定时任务共用同一份「采集中/成功/失败」状态。
+    """
+    from core.mp_sync import note_job_finished, note_job_running
+
+    session = wx_db.get_session()
+    try:
+        mp = session.query(Feed).filter(Feed.id == mp_id).first()
+        if mp is None:
+            print_warning(f"公众号不存在或已删除，跳过采集: {mp_id}")
+            return None
+        mp_name = mp.mp_name
+        task = None
+        if task_id:
+            task = session.query(MessageTask).filter(MessageTask.id == task_id).first()
+
+        note_job_running(mp_id, mp_name=mp_name, reason="scheduler" if task else "manual")
+        try:
+            result = do_job(mp=mp, task=task, isTest=isTest) or {}
+        except Exception as error:
+            note_job_finished(mp_id, error=str(error))
+            raise
+        if result.get("success"):
+            # 采集成功：webhook 等后置步骤的报错不影响采集状态
+            note_job_finished(mp_id, article_count=result.get("count", 0))
+        else:
+            note_job_finished(mp_id, error=result.get("error") or "采集失败")
+        return result
+    finally:
+        session.close()
 import json
 def get_feeds(task:MessageTask=None):
      mps = json.loads(task.mps_id) if task.mps_id else []
