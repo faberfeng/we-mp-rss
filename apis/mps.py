@@ -227,6 +227,7 @@ async def get_mps(
     offset: int = Query(0, ge=0),
     kw: str = Query(""),
     status: int = Query(None, description="状态筛选: 1=启用, 0=停用, 不传=全部"),
+    tag_id: str = Query(None, description="按标签筛选公众号"),
     current_user: dict = Depends(get_current_user_or_ak)
 ):
     session = DB.get_session()
@@ -237,6 +238,16 @@ async def get_mps(
             query = query.filter(Feed.mp_name.ilike(f"%{kw}%"))
         if status is not None:
             query = query.filter(Feed.status == status)
+        if tag_id:
+            import json
+            from core.models.tags import Tags
+            tag = session.query(Tags).filter(Tags.id == tag_id).first()
+            try:
+                tag_data = json.loads(tag.mps_id or "[]") if tag else []
+                tagged_ids = [str(item.get("id")) for item in tag_data if isinstance(item, dict) and item.get("id")]
+            except (TypeError, ValueError):
+                tagged_ids = []
+            query = query.filter(Feed.id.in_(tagged_ids))
         total = query.count()
         mps = query.order_by(Feed.created_at.desc()).limit(limit).offset(offset).all()
         mps_list = [{
